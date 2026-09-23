@@ -18,8 +18,11 @@ vi.stubEnv("MONGO_DATABASE", DATABASE);
 vi.resetModules();
 
 const { Inbox } = await import("../../../src/events/models/inbox.js");
-const { claimEvents } =
+const { claimEvents, processExpiredEvents, update } =
   await import("../../../src/events/repositories/inbox.repository.js");
+const { clearInboxMessageHandlers, registerInboxMessageHandler } =
+  await import("../../../src/events/services/inbox-message-handlers.js");
+const { logger } = await import("../../../src/common/logger.js");
 const { InboxSubscriber } =
   await import("../../../src/events/subscribers/inbox.subscriber.js");
 const { db: serviceDb, mongoClient } =
@@ -196,5 +199,80 @@ describe("inbox fifo", () => {
     expect(events).toHaveLength(1);
     expect(events[0]._id).toBe("6");
     expect(events[0].segregationRef).toBe("ref_4");
+  });
+});
+
+// A handler that outlives its claim still holds the whole row in memory, and
+// its final write would put that copy back over whatever happened since.
+describe("inbox final write is fenced on the claim", () => {
+  const SOURCE = "CLAIM-FENCE-TEST";
+  const REF = "claim_fence_ref";
+
+  const aPublishedRow = () =>
+    Inbox.createMock({
+      _id: `fence-${randomUUID()}`,
+      messageId: `fence-${randomUUID()}`,
+      source: SOURCE,
+      segregationRef: REF,
+      completionAttempts: 0,
+    });
+
+  const theRow = (row) => inbox.findOne({ _id: row._id });
+
+  beforeEach(async () => {
+    await fifo.deleteMany({});
+    await inbox.deleteMany({});
+  });
+
+  afterEach(() => {
+    clearInboxMessageHandlers();
+  });
+
+  it("writes nothing with a stale token", async () => {
+    const row = aPublishedRow();
+    await inbox.insertOne(row.toDocument());
+    const [claimed] = await claimEvents("live-token", REF);
+    const before = await theRow(row);
+
+    claimed.markAsComplete();
+    const result = await update(claimed, "stale-token");
+
+    expect(result.matchedCount).toBe(0);
+    expect(await theRow(row)).toEqual(before);
+  });
+
+  it("completes the row with the live token", async () => {
+    const row = aPublishedRow();
+    await inbox.insertOne(row.toDocument());
+    registerInboxMessageHandler(SOURCE, async () => {});
+
+    await new InboxSubscriber().processWithLock(randomUUID(), REF);
+
+    const stored = await theRow(row);
+    expect(stored.status).toBe("COMPLETED");
+    expect(stored.claimedBy).toBeNull();
+  });
+
+  it("leaves a row reclaimed mid-handler as the expiry sweep left it", async () => {
+    const row = aPublishedRow();
+    await inbox.insertOne(row.toDocument());
+    const warn = vi.spyOn(logger, "warn");
+    let swept;
+    registerInboxMessageHandler(SOURCE, async () => {
+      await inbox.updateOne(
+        { _id: row._id },
+        { $set: { claimExpiresAt: new Date(Date.now() - 1000) } },
+      );
+      await processExpiredEvents();
+      swept = await theRow(row);
+    });
+
+    await new InboxSubscriber().processWithLock(randomUUID(), REF);
+
+    expect(swept.status).toBe("FAILED");
+    expect(await theRow(row)).toEqual(swept);
+    expect(warn).toHaveBeenCalledWith(
+      `Inbox event ${row.messageId} was reclaimed before its handler finished`,
+    );
   });
 });

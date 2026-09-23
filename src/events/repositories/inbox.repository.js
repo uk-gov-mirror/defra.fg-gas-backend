@@ -235,11 +235,15 @@ export const insertOne = async (inbox, session) => {
   return db.collection(collection).insertOne(inbox.toDocument(), { session });
 };
 
-export const update = async (inbox) => {
+// Matching on `claimedBy` stops a handler that outlived its claim from
+// overwriting whatever happened to the row after the claim expired.
+export const update = async (inbox, claimedBy) => {
   const document = inbox.toDocument();
   const { _id, ...updateDoc } = document;
 
-  return db.collection(collection).updateOne({ _id }, { $set: updateDoc });
+  return db
+    .collection(collection)
+    .updateOne({ _id, claimedBy }, { $set: updateDoc });
 };
 
 export const findPage = async ({

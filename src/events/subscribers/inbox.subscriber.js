@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { setTimeout } from "node:timers/promises";
 
@@ -21,6 +22,8 @@ import {
 } from "../repositories/inbox.repository.js";
 
 export class InboxSubscriber {
+  asyncLocalStorage = new AsyncLocalStorage();
+
   static ACTOR = "INBOX";
 
   constructor() {
@@ -60,7 +63,9 @@ export class InboxSubscriber {
     }
     try {
       const events = await claimEvents(claimToken, segregationRef);
-      await this.processEvents(events);
+      await this.asyncLocalStorage.run(claimToken, async () =>
+        this.processEvents(events),
+      );
     } finally {
       await freeFifoLock(InboxSubscriber.ACTOR, segregationRef);
     }
@@ -107,16 +112,33 @@ export class InboxSubscriber {
       logger.info(`Cleaned up ${results?.modifiedCount} stale fifo locks`);
   }
 
+  // False when the claim was lost and nothing was written.
+  async writeClaimed(inboxEvent) {
+    const claimedBy = this.asyncLocalStorage.getStore();
+    const result = await update(inboxEvent, claimedBy);
+
+    if (result?.matchedCount === 0) {
+      logger.warn(
+        `Inbox event ${inboxEvent.messageId} was reclaimed before its handler finished`,
+      );
+      return false;
+    }
+
+    return true;
+  }
+
   async markEventFailed(inboxEvent, error) {
     inboxEvent.markAsFailed(error);
-    await update(inboxEvent);
-    logger.info(`Marked inbox event unsent ${inboxEvent.messageId}`);
+    if (await this.writeClaimed(inboxEvent)) {
+      logger.info(`Marked inbox event unsent ${inboxEvent.messageId}`);
+    }
   }
 
   async markEventComplete(inboxEvent) {
     inboxEvent.markAsComplete();
-    await update(inboxEvent);
-    logger.info(`Marked inbox event as complete ${inboxEvent.messageId}`);
+    if (await this.writeClaimed(inboxEvent)) {
+      logger.info(`Marked inbox event as complete ${inboxEvent.messageId}`);
+    }
   }
 
   async handleEvent(message) {
